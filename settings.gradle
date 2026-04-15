@@ -1,0 +1,2 @@
+rootProject.name = "CodespacesVNC"
+include ':app'

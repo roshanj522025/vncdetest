@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Codespaces VNC</string>
+    <string name="login_title">Sign in to GitHub</string>
+    <string name="login_subtitle">Sign in to access your Codespace</string>
+</resources>

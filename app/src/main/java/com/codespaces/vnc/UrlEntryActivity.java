@@ -27,7 +27,8 @@ import android.widget.Toast;
 public class UrlEntryActivity extends Activity {
 
     private static final String PREFS_NAME = "VncPrefs";
-    private static final String PREF_VNC_URL = "last_vnc_url";
+    private static final String PREF_VNC_URL   = "last_vnc_url";
+    private static final String PREF_CODESPACE = "codespace_name";
 
     private EditText urlInput;
 
@@ -136,14 +137,34 @@ public class UrlEntryActivity extends Activity {
         }
 
         // Save for next time
+        String codespaceName = deriveCodespaceName(url);
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
                 .edit()
                 .putString(PREF_VNC_URL, url)
+                .putString(PREF_CODESPACE, codespaceName)
                 .apply();
 
         Intent intent = new Intent(this, MainActivity.class);
         intent.putExtra(MainActivity.EXTRA_VNC_URL, url);
         startActivity(intent);
         finish();
+    }
+
+    private String deriveCodespaceName(String vncUrl) {
+        if (vncUrl == null || vncUrl.isEmpty()) return "";
+        try {
+            String host = vncUrl.replace("https://", "").split("/")[0];
+            String sub  = host.replace(".app.github.dev", "");
+            int lastDash = sub.lastIndexOf("-");
+            if (lastDash > 0) {
+                String portPart = sub.substring(lastDash + 1);
+                if (portPart.matches("\\d+")) {
+                    return sub.substring(0, lastDash);
+                }
+            }
+            return sub;
+        } catch (Exception e) {
+            return "";
+        }
     }
 }

@@ -183,7 +183,7 @@ public class LoginActivity extends Activity {
         // Flush cookies so MainActivity WebView shares the same session
         CookieManager.getInstance().flush();
 
-        Intent intent = new Intent(LoginActivity.this, UrlEntryActivity.class);
+        Intent intent = new Intent(LoginActivity.this, CodespacesWakeActivity.class);
         startActivity(intent);
         finish(); // Remove login screen from back stack
     }

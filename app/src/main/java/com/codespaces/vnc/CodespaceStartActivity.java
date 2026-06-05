@@ -11,63 +11,76 @@ import android.os.Handler;
 import android.os.Looper;
 import android.view.Gravity;
 import android.view.ViewGroup;
-import android.webkit.CookieManager;
-import android.webkit.JavascriptInterface;
-import android.webkit.WebSettings;
-import android.webkit.WebView;
+import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.TextView;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
 /**
- * Auto-starts the user's Codespace via the GitHub API, then launches the VNC view.
+ * Starts the user's Codespace using a GitHub PAT, then launches the VNC WebView.
  *
- * Auth strategy:
- *   GitHub's REST API accepts session cookies for first-party web requests.
- *   We use a hidden WebView to make credentialed fetch() calls, which automatically
- *   attach the github.com session cookies captured during login.
+ * Auth: Authorization: Bearer <PAT>   (PAT with 'codespace' scope)
  *
  * Flow:
- *   1. GET /user/codespaces  → pick the right codespace
- *   2. POST /user/codespaces/{name}/start  (if not already Available)
- *   3. Poll GET /user/codespaces/{name} every 3s until state == "Available"
+ *   1. GET  /user/codespaces          → pick codespace
+ *   2. POST /user/codespaces/{name}/start  (if not Available)
+ *   3. Poll GET /user/codespaces/{name}  every 3 s until Available
  *   4. Build VNC URL → launch MainActivity
  */
 public class CodespaceStartActivity extends Activity {
 
-    private static final String PREFS_NAME    = "VncPrefs";
-    private static final String PREF_VNC_URL  = "last_vnc_url";
-    private static final String PREF_CS_NAME  = "last_codespace_name";
-    private static final String PREF_GH_TOKEN = "gh_token";
+    private static final String PREFS_NAME       = "VncPrefs";
+    private static final String PREF_VNC_URL     = "last_vnc_url";
+    private static final String PREF_CS_NAME     = "last_codespace_name";
+    private static final String PREF_PAT         = "github_pat";
 
-    private static final int POLL_INTERVAL_MS = 3000;
+    private static final int POLL_INTERVAL_MS = 4000;
     private static final int MAX_POLLS        = 60;
 
-    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final Handler          mainHandler = new Handler(Looper.getMainLooper());
+    private final ExecutorService  executor    = Executors.newSingleThreadExecutor();
 
     private TextView    statusText;
     private TextView    subText;
-    private WebView     apiWebView;   // hidden; used for credentialed fetch()
-    private boolean     launched = false;
-    private int         pollCount = 0;
-    private String      codespaceName;
+    private ProgressBar spinner;
+
+    private boolean launched   = false;
+    private int     pollCount  = 0;
+    private String  codespaceName;
+    private String  pat;
     private SharedPreferences prefs;
 
-    // -------------------------------------------------------------------------
+    // ──────────────────────────────────────────────────────────────────────────
 
-    @SuppressLint("SetJavaScriptEnabled")
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+
         buildUi();
-        setupApiWebView();
-        beginFlow();
+
+        pat = prefs.getString(PREF_PAT, "");
+        if (pat.isEmpty()) {
+            goToPATEntry();
+            return;
+        }
+
+        setStatus("Connecting to GitHub…", "Using Personal Access Token");
+        executor.submit(this::listCodespaces);
     }
 
-    // -------------------------------------------------------------------------
-    // UI
-    // -------------------------------------------------------------------------
+    // ── UI ────────────────────────────────────────────────────────────────────
 
     private void buildUi() {
         LinearLayout root = new LinearLayout(this);
@@ -75,6 +88,13 @@ public class CodespaceStartActivity extends Activity {
         root.setBackgroundColor(Color.parseColor("#0d1117"));
         root.setGravity(Gravity.CENTER);
         root.setPadding(64, 0, 64, 0);
+
+        TextView logo = new TextView(this);
+        logo.setText("☁");
+        logo.setTextSize(48f);
+        logo.setTextColor(Color.parseColor("#58a6ff"));
+        logo.setGravity(Gravity.CENTER);
+        logo.setPadding(0, 0, 0, 24);
 
         TextView appTitle = new TextView(this);
         appTitle.setText("Codespaces VNC");
@@ -84,7 +104,7 @@ public class CodespaceStartActivity extends Activity {
         appTitle.setGravity(Gravity.CENTER);
 
         statusText = new TextView(this);
-        statusText.setText("Connecting to GitHub…");
+        statusText.setText("Starting…");
         statusText.setTextSize(16f);
         statusText.setTextColor(Color.parseColor("#58a6ff"));
         statusText.setGravity(Gravity.CENTER);
@@ -97,239 +117,264 @@ public class CodespaceStartActivity extends Activity {
         subText.setGravity(Gravity.CENTER);
         subText.setPadding(0, 0, 0, 32);
 
-        ProgressBar spinner = new ProgressBar(this, null, android.R.attr.progressBarStyleLarge);
-        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(
+        spinner = new ProgressBar(this, null, android.R.attr.progressBarStyleLarge);
+        LinearLayout.LayoutParams sp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT);
-        p.setMargins(0, 16, 0, 0);
-        spinner.setLayoutParams(p);
+        sp.setMargins(0, 16, 0, 32);
+        spinner.setLayoutParams(sp);
 
+        // Change-token button (small, at the bottom)
+        Button changePat = new Button(this);
+        changePat.setText("Change Token");
+        changePat.setTextColor(Color.parseColor("#8b949e"));
+        changePat.setBackgroundColor(Color.parseColor("#161b22"));
+        changePat.setTextSize(12f);
+        changePat.setPadding(24, 12, 24, 12);
+        changePat.setOnClickListener(v -> goToPATEntry());
+
+        root.addView(logo);
         root.addView(appTitle);
         root.addView(statusText);
         root.addView(subText);
         root.addView(spinner);
+        root.addView(changePat);
         setContentView(root);
     }
 
     private void setStatus(String status, String sub) {
         mainHandler.post(() -> {
-            statusText.setText(status);
-            if (sub != null) subText.setText(sub);
+            if (statusText != null) statusText.setText(status);
+            if (sub != null && subText != null) subText.setText(sub);
         });
     }
 
-    // -------------------------------------------------------------------------
-    // Hidden API WebView — makes credentialed fetch() calls using session cookies
-    // -------------------------------------------------------------------------
+    // ── API helpers ───────────────────────────────────────────────────────────
 
-    @SuppressLint("SetJavaScriptEnabled")
-    private void setupApiWebView() {
-        apiWebView = new WebView(this);
-        WebSettings s = apiWebView.getSettings();
-        s.setJavaScriptEnabled(true);
-        s.setDomStorageEnabled(true);
-        s.setUserAgentString(
-                "Mozilla/5.0 (Linux; Android 13; Pixel 7) " +
-                "AppleWebKit/537.36 (KHTML, like Gecko) " +
-                "Chrome/120.0.0.0 Mobile Safari/537.36");
+    /**
+     * Makes a GitHub API call and returns the response body as a String.
+     * Throws on non-2xx (so callers can catch and handle).
+     */
+    private ApiResult apiCall(String method, String urlStr) throws Exception {
+        URL url = new URL(urlStr);
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        conn.setRequestMethod(method);
+        conn.setRequestProperty("Authorization", "Bearer " + pat);
+        conn.setRequestProperty("Accept", "application/vnd.github+json");
+        conn.setRequestProperty("X-GitHub-Api-Version", "2022-11-28");
+        conn.setConnectTimeout(15_000);
+        conn.setReadTimeout(20_000);
 
-        // Share cookies with the login WebView
-        CookieManager.getInstance().setAcceptCookie(true);
-        CookieManager.getInstance().setAcceptThirdPartyCookies(apiWebView, true);
+        if ("POST".equals(method)) {
+            conn.setDoOutput(true);
+            conn.setRequestProperty("Content-Length", "0");
+            try (OutputStream os = conn.getOutputStream()) { os.flush(); }
+        }
 
-        apiWebView.addJavascriptInterface(new ApiBridge(), "API");
-        // Load github.com so fetch() requests share its origin cookies
-        apiWebView.loadUrl("https://github.com/codespaces");
+        int code = conn.getResponseCode();
+        StringBuilder sb = new StringBuilder();
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(
+                code >= 400 ? conn.getErrorStream() : conn.getInputStream()))) {
+            String line;
+            while ((line = br.readLine()) != null) sb.append(line);
+        }
+        conn.disconnect();
+        return new ApiResult(code, sb.toString());
     }
 
-    // -------------------------------------------------------------------------
-    // Flow
-    // -------------------------------------------------------------------------
-
-    private void beginFlow() {
-        // Give the hidden WebView a moment to load cookies, then start
-        mainHandler.postDelayed(this::listCodespaces, 2500);
+    static class ApiResult {
+        final int    status;
+        final String body;
+        ApiResult(int s, String b) { status = s; body = b; }
     }
+
+    // ── Flow ──────────────────────────────────────────────────────────────────
 
     /** Step 1: list codespaces */
     private void listCodespaces() {
-        setStatus("Fetching your Codespaces…", null);
-        runFetch("GET", "https://api.github.com/user/codespaces", "list");
-    }
-
-    /** Step 2: start the codespace */
-    private void startCodespace(String name) {
-        codespaceName = name;
-        prefs.edit().putString(PREF_CS_NAME, name).apply();
-        setStatus("Waking up: " + name, "Sending start request…");
-        runFetch("POST", "https://api.github.com/user/codespaces/" + name + "/start", "start");
-    }
-
-    /** Step 3: poll state */
-    private void pollState() {
-        runFetch("GET", "https://api.github.com/user/codespaces/" + codespaceName, "poll");
-    }
-
-    // -------------------------------------------------------------------------
-    // JS bridge — receives API responses from the hidden WebView
-    // -------------------------------------------------------------------------
-
-    class ApiBridge {
-
-        @JavascriptInterface
-        public void onResponse(String tag, int status, String body) {
-            mainHandler.post(() -> handleResponse(tag, status, body));
-        }
-
-        @JavascriptInterface
-        public void onError(String tag, String error) {
-            mainHandler.post(() -> {
-                if ("list".equals(tag) || "start".equals(tag)) {
-                    // API call failed — fall back to saved URL
-                    fallbackToSavedUrl();
-                } else {
-                    setStatus("Network error: " + error, "Retrying…");
-                    mainHandler.postDelayed(CodespaceStartActivity.this::pollState, POLL_INTERVAL_MS);
-                }
-            });
-        }
-    }
-
-    private void handleResponse(String tag, int status, String body) {
-        if (status == 401 || status == 403) {
-            goToLogin();
-            return;
-        }
-
+        setStatus("Fetching your Codespaces…", "");
         try {
-            switch (tag) {
-                case "list":
-                    handleList(body);
-                    break;
-                case "start":
-                    // Start returns 200 (already running) or 202 (starting)
-                    // Either way, begin polling
-                    mainHandler.postDelayed(this::pollState, POLL_INTERVAL_MS);
-                    break;
-                case "poll":
-                    handlePoll(body);
-                    break;
+            ApiResult r = apiCall("GET", "https://api.github.com/user/codespaces");
+
+            if (r.status == 401 || r.status == 403) {
+                mainHandler.post(this::handleBadToken);
+                return;
+            }
+            if (r.status < 200 || r.status >= 300) {
+                setStatus("API error " + r.status, r.body);
+                return;
+            }
+
+            JSONObject root  = new JSONObject(r.body);
+            JSONArray  list  = root.optJSONArray("codespaces");
+
+            if (list == null || list.length() == 0) {
+                setStatus("No Codespaces found.", "Create one at github.com/codespaces");
+                return;
+            }
+
+            // Prefer previously used codespace
+            String savedName = prefs.getString(PREF_CS_NAME, "");
+            JSONObject cs = null;
+            if (!savedName.isEmpty()) {
+                for (int i = 0; i < list.length(); i++) {
+                    JSONObject c = list.getJSONObject(i);
+                    if (savedName.equals(c.optString("name"))) { cs = c; break; }
+                }
+            }
+            if (cs == null) cs = list.getJSONObject(0);
+
+            // If multiple codespaces and none saved, show picker
+            if (cs == null && list.length() > 1) {
+                showPicker(list);
+                return;
+            }
+
+            pickCodespace(cs);
+
+        } catch (Exception e) {
+            setStatus("Network error", e.getMessage());
+        }
+    }
+
+    private void pickCodespace(JSONObject cs) {
+        try {
+            codespaceName = cs.getString("name");
+            prefs.edit().putString(PREF_CS_NAME, codespaceName).apply();
+            String state  = cs.optString("state", "Unknown");
+
+            if ("Available".equalsIgnoreCase(state)) {
+                String vncUrl = buildVncUrl(cs);
+                prefs.edit().putString(PREF_VNC_URL, vncUrl).apply();
+                launchVnc(vncUrl);
+            } else {
+                startCodespace(codespaceName);
             }
         } catch (Exception e) {
-            setStatus("Parse error: " + e.getMessage(), null);
+            setStatus("Error", e.getMessage());
         }
     }
 
-    private void handleList(String body) throws Exception {
-        org.json.JSONObject root = new org.json.JSONObject(body);
-        org.json.JSONArray list = root.optJSONArray("codespaces");
-
-        if (list == null || list.length() == 0) {
-            setStatus("No Codespaces found.", "Create one at github.com/codespaces");
-            return;
-        }
-
-        // Prefer previously used codespace
-        String savedName = prefs.getString(PREF_CS_NAME, "");
-        org.json.JSONObject cs = null;
-
-        if (!savedName.isEmpty()) {
-            for (int i = 0; i < list.length(); i++) {
-                org.json.JSONObject c = list.getJSONObject(i);
-                if (savedName.equals(c.optString("name"))) { cs = c; break; }
-            }
-        }
-        if (cs == null) cs = list.getJSONObject(0);
-
-        String name  = cs.getString("name");
-        String state = cs.optString("state", "Unknown");
-        String webUrl = cs.optString("web_url", "");
-
-        codespaceName = name;
-        prefs.edit().putString(PREF_CS_NAME, name).apply();
-
-        if ("Available".equalsIgnoreCase(state)) {
-            String vncUrl = buildVncUrl(name, webUrl);
-            prefs.edit().putString(PREF_VNC_URL, vncUrl).apply();
-            launchVnc(vncUrl);
-        } else {
-            startCodespace(name);
-        }
-    }
-
-    private void handlePoll(String body) throws Exception {
-        org.json.JSONObject cs = new org.json.JSONObject(body);
-        String state  = cs.optString("state", "Unknown");
-        String webUrl = cs.optString("web_url", "");
-        pollCount++;
-
-        int elapsed = pollCount * POLL_INTERVAL_MS / 1000;
-        setStatus("Starting Codespace…", "State: " + state + "  (" + elapsed + "s)");
-
-        if ("Available".equalsIgnoreCase(state)) {
-            String vncUrl = buildVncUrl(codespaceName, webUrl);
-            prefs.edit().putString(PREF_VNC_URL, vncUrl).apply();
-            launchVnc(vncUrl);
-            return;
-        }
-
-        if ("Failed".equalsIgnoreCase(state) || "Deleted".equalsIgnoreCase(state)) {
-            setStatus("Codespace " + state + ".", "Please check github.com/codespaces");
-            return;
-        }
-
-        if (pollCount >= MAX_POLLS) {
-            setStatus("Timed out waiting for Codespace.", "Try again or open in browser first.");
-            return;
-        }
-
-        mainHandler.postDelayed(this::pollState, POLL_INTERVAL_MS);
-    }
-
-    // -------------------------------------------------------------------------
-    // Helpers
-    // -------------------------------------------------------------------------
-
-    /**
-     * Executes a fetch() call inside the hidden WebView, using its session cookies.
-     * The result is passed back via ApiBridge.onResponse / onError.
-     */
-    private void runFetch(String method, String url, String tag) {
-        String js =
-            "(function(){" +
-            "  var opts = {method:'" + method + "',credentials:'include'," +
-            "    headers:{'Accept':'application/vnd.github+json'," +
-            "             'X-GitHub-Api-Version':'2022-11-28'}};" +
-            (method.equals("POST") ? "  opts.body = '';" : "") +
-            "  fetch('" + url + "', opts)" +
-            "    .then(function(r){ var s=r.status; return r.text().then(function(b){" +
-            "       API.onResponse('" + tag + "', s, b); }); })" +
-            "    .catch(function(e){ API.onError('" + tag + "', e.toString()); });" +
-            "})();";
-        mainHandler.post(() -> apiWebView.evaluateJavascript(js, null));
-    }
-
-    private String buildVncUrl(String csName, String webUrl) {
-        if (webUrl != null && !webUrl.isEmpty()) {
+    /** Step 2: start codespace */
+    private void startCodespace(String name) {
+        setStatus("Starting: " + name, "Sending wake request…");
+        executor.submit(() -> {
             try {
+                ApiResult r = apiCall("POST",
+                        "https://api.github.com/user/codespaces/" + name + "/start");
+
+                if (r.status == 401 || r.status == 403) {
+                    mainHandler.post(this::handleBadToken);
+                    return;
+                }
+                // 200 = already available, 202 = starting — both fine
+                mainHandler.postDelayed(this::doPoll, POLL_INTERVAL_MS);
+
+            } catch (Exception e) {
+                setStatus("Start error", e.getMessage());
+            }
+        });
+    }
+
+    /** Step 3: poll until Available */
+    private void doPoll() {
+        if (launched) return;
+        if (pollCount >= MAX_POLLS) {
+            setStatus("Timed out.", "Try again or open in browser first.");
+            return;
+        }
+        pollCount++;
+        executor.submit(() -> {
+            try {
+                ApiResult r = apiCall("GET",
+                        "https://api.github.com/user/codespaces/" + codespaceName);
+
+                if (r.status == 401 || r.status == 403) {
+                    mainHandler.post(this::handleBadToken);
+                    return;
+                }
+
+                JSONObject cs    = new JSONObject(r.body);
+                String     state = cs.optString("state", "Unknown");
+                int        secs  = pollCount * POLL_INTERVAL_MS / 1000;
+
+                mainHandler.post(() ->
+                    setStatus("Starting Codespace…", "State: " + state + "  (" + secs + "s)"));
+
+                if ("Available".equalsIgnoreCase(state)) {
+                    String vncUrl = buildVncUrl(cs);
+                    prefs.edit().putString(PREF_VNC_URL, vncUrl).apply();
+                    launchVnc(vncUrl);
+                } else if ("Failed".equalsIgnoreCase(state) || "Deleted".equalsIgnoreCase(state)) {
+                    setStatus("Codespace " + state + ".", "Check github.com/codespaces");
+                } else {
+                    mainHandler.postDelayed(this::doPoll, POLL_INTERVAL_MS);
+                }
+
+            } catch (Exception e) {
+                mainHandler.postDelayed(this::doPoll, POLL_INTERVAL_MS);
+            }
+        });
+    }
+
+    // ── Picker (multiple codespaces) ──────────────────────────────────────────
+
+    private void showPicker(JSONArray list) {
+        mainHandler.post(() -> {
+            LinearLayout root = new LinearLayout(this);
+            root.setOrientation(LinearLayout.VERTICAL);
+            root.setBackgroundColor(Color.parseColor("#0d1117"));
+            root.setPadding(48, 80, 48, 48);
+
+            TextView title = new TextView(this);
+            title.setText("Choose a Codespace");
+            title.setTextSize(20f);
+            title.setTextColor(Color.WHITE);
+            title.setGravity(Gravity.CENTER);
+            title.setPadding(0, 0, 0, 40);
+            root.addView(title);
+
+            try {
+                for (int i = 0; i < list.length(); i++) {
+                    JSONObject cs    = list.getJSONObject(i);
+                    String     name  = cs.optString("name", "");
+                    JSONObject repo  = cs.optJSONObject("repository");
+                    String     label = repo != null
+                            ? repo.optString("full_name", name) : name;
+                    String     state = cs.optString("state", "");
+
+                    Button btn = new Button(this);
+                    btn.setText(label + "\n" + state);
+                    btn.setTextColor(Color.WHITE);
+                    btn.setBackgroundColor(Color.parseColor("#161b22"));
+                    btn.setPadding(32, 24, 32, 24);
+                    LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                            ViewGroup.LayoutParams.MATCH_PARENT,
+                            ViewGroup.LayoutParams.WRAP_CONTENT);
+                    lp.setMargins(0, 12, 0, 0);
+                    btn.setLayoutParams(lp);
+                    final JSONObject chosen = cs;
+                    btn.setOnClickListener(v -> executor.submit(() -> pickCodespace(chosen)));
+                    root.addView(btn);
+                }
+            } catch (Exception ignored) {}
+
+            setContentView(root);
+        });
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    private String buildVncUrl(JSONObject cs) {
+        try {
+            String webUrl = cs.optString("web_url", "");
+            if (!webUrl.isEmpty()) {
                 String host = new java.net.URL(webUrl).getHost();
                 String base = host.replace(".github.dev", "");
                 return "https://" + base + "-6080.app.github.dev/vnc.html";
-            } catch (Exception ignored) {}
-        }
-        return "https://" + csName + "-6080.app.github.dev/vnc.html";
-    }
-
-    private void fallbackToSavedUrl() {
-        String savedUrl = prefs.getString(PREF_VNC_URL, "");
-        if (!savedUrl.isEmpty()) {
-            launchVnc(savedUrl);
-        } else {
-            mainHandler.post(() -> {
-                startActivity(new Intent(this, UrlEntryActivity.class));
-                finish();
-            });
-        }
+            }
+        } catch (Exception ignored) {}
+        return "https://" + codespaceName + "-6080.app.github.dev/vnc.html";
     }
 
     private void launchVnc(String vncUrl) {
@@ -344,16 +389,21 @@ public class CodespaceStartActivity extends Activity {
         }, 500);
     }
 
-    private void goToLogin() {
-        mainHandler.post(() -> {
-            startActivity(new Intent(this, LoginActivity.class));
-            finish();
-        });
+    private void handleBadToken() {
+        setStatus("Authentication failed.", "Your PAT may be expired or missing the 'codespace' scope.");
+        // Clear stored PAT so user is prompted to re-enter
+        prefs.edit().remove(PREF_PAT).apply();
+        mainHandler.postDelayed(this::goToPATEntry, 2000);
+    }
+
+    private void goToPATEntry() {
+        startActivity(new Intent(this, PATEntryActivity.class));
+        finish();
     }
 
     @Override
     protected void onDestroy() {
-        if (apiWebView != null) apiWebView.destroy();
+        executor.shutdownNow();
         super.onDestroy();
     }
 }

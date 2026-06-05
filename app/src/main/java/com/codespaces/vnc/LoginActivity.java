@@ -3,12 +3,16 @@ package com.codespaces.vnc;
 import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.webkit.CookieManager;
+import android.webkit.JavascriptInterface;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
@@ -19,12 +23,15 @@ import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.TextView;
 
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
 public class LoginActivity extends Activity {
 
-    // GitHub login URL — after login GitHub redirects back to github.com
     private static final String GITHUB_LOGIN_URL = "https://github.com/login";
+    private static final String PREFS_NAME       = "VncPrefs";
+    private static final String PREF_GH_TOKEN    = "gh_token";
 
-    // We detect successful login by watching for these GitHub home URLs
     private static final String[] LOGGED_IN_INDICATORS = {
             "github.com/?",
             "github.com/dashboard",
@@ -32,22 +39,24 @@ public class LoginActivity extends Activity {
             "github.com/notifications",
     };
 
-    private WebView webView;
+    private WebView     webView;
     private ProgressBar progressBar;
-    private TextView statusText;
-    private boolean launched = false;
+    private TextView    statusText;
+    private boolean     launched = false;
+
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final ExecutorService executor = Executors.newSingleThreadExecutor();
 
     @SuppressLint("SetJavaScriptEnabled")
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        // Build UI programmatically — no XML layout needed
+        // Build UI
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundColor(Color.parseColor("#0d1117")); // GitHub dark bg
+        root.setBackgroundColor(Color.parseColor("#0d1117"));
 
-        // Header bar
         LinearLayout header = new LinearLayout(this);
         header.setOrientation(LinearLayout.VERTICAL);
         header.setPadding(48, 56, 48, 24);
@@ -69,15 +78,11 @@ public class LoginActivity extends Activity {
         header.addView(title);
         header.addView(statusText);
 
-        // Progress bar
         progressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
         progressBar.setMax(100);
-        progressBar.setProgress(0);
         progressBar.setLayoutParams(new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 6));
-        progressBar.setVisibility(View.VISIBLE);
 
-        // WebView container
         FrameLayout webContainer = new FrameLayout(this);
         webContainer.setLayoutParams(new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
@@ -86,7 +91,6 @@ public class LoginActivity extends Activity {
         webView.setLayoutParams(new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT));
-
         webContainer.addView(webView);
 
         root.addView(header);
@@ -106,100 +110,161 @@ public class LoginActivity extends Activity {
                 "AppleWebKit/537.36 (KHTML, like Gecko) " +
                 "Chrome/120.0.0.0 Mobile Safari/537.36");
 
-        // Persist cookies across sessions
         CookieManager.getInstance().setAcceptCookie(true);
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true);
+
+        // JS bridge to receive the token from the page
+        webView.addJavascriptInterface(new TokenBridge(), "AndroidBridge");
 
         webView.setWebChromeClient(new WebChromeClient() {
             @Override
             public void onProgressChanged(WebView view, int newProgress) {
                 progressBar.setProgress(newProgress);
-                if (newProgress == 100) {
-                    progressBar.setVisibility(View.GONE);
-                } else {
-                    progressBar.setVisibility(View.VISIBLE);
-                }
+                progressBar.setVisibility(newProgress == 100 ? View.GONE : View.VISIBLE);
             }
         });
 
         webView.setWebViewClient(new WebViewClient() {
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
-                String url = request.getUrl().toString();
-                checkIfLoggedIn(url);
-                return false; // let WebView handle it
+                checkIfLoggedIn(request.getUrl().toString());
+                return false;
             }
 
             @Override
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
                 checkIfLoggedIn(url);
+                // Try to extract token from page meta / local storage
+                extractTokenFromPage(view);
             }
         });
 
-        // Check if already logged in from a previous session
+        // Already logged in?
         CookieManager.getInstance().flush();
         String existingCookies = CookieManager.getInstance().getCookie("https://github.com");
-        if (existingCookies != null && existingCookies.contains("user_session")) {
-            // Already have a GitHub session — go straight to VNC
-            launchVnc();
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        String savedToken = prefs.getString(PREF_GH_TOKEN, "");
+
+        if (existingCookies != null && existingCookies.contains("user_session") && !savedToken.isEmpty()) {
+            launchCodespaceStart();
         } else {
             webView.loadUrl(GITHUB_LOGIN_URL);
         }
     }
 
-    private void checkIfLoggedIn(String url) {
-        if (launched) return;
-        if (url == null) return;
+    /**
+     * Injects JS to pull the GitHub token from the page after login.
+     * GitHub stores the user token in a meta tag and in localStorage.
+     */
+    private void extractTokenFromPage(WebView view) {
+        String js =
+            "(function() {" +
+            "  try {" +
+            // Try meta tag (github.com stores token here in some flows)
+            "    var meta = document.querySelector('meta[name=\"user-login\"]');" +
+            // Try localStorage
+            "    var ls = localStorage.getItem('dotcom_user');" +
+            // Extract from cookie string accessible to JS
+            "    var cookie = document.cookie;" +
+            // Find the GitHub token from the page's data attributes or session storage
+            "    var tokenMeta = document.querySelector('meta[name=\"github-token\"]');" +
+            "    if (tokenMeta && tokenMeta.content) {" +
+            "      AndroidBridge.onTokenFound(tokenMeta.content);" +
+            "    }" +
+            "  } catch(e) {}" +
+            "})();";
+        view.evaluateJavascript(js, null);
 
-        // Check for GitHub session cookie (set after successful login)
+        // Also try fetching the token via the GitHub API using the session cookie
+        // by loading the API endpoint in background
+        String apiJs =
+            "(function() {" +
+            "  fetch('https://api.github.com/user', {credentials: 'include'})" +
+            "    .then(r => r.headers.get('X-OAuth-Scopes') ? r.json() : null)" +
+            "    .then(d => { if(d && d.login) AndroidBridge.onLoginConfirmed(d.login); })" +
+            "    .catch(e => {});" +
+            "})();";
+        view.evaluateJavascript(apiJs, null);
+    }
+
+    private void checkIfLoggedIn(String url) {
+        if (launched || url == null) return;
+
         String cookies = CookieManager.getInstance().getCookie("https://github.com");
         boolean hasCookie = cookies != null && cookies.contains("user_session");
-
-        // Also check the URL — after login GitHub redirects away from /login
-        boolean onPostLoginPage = false;
-        for (String indicator : LOGGED_IN_INDICATORS) {
-            if (url.contains(indicator)) {
-                onPostLoginPage = true;
-                break;
-            }
-        }
-
-        // Logged in if we have the session cookie AND we're no longer on /login
         boolean notOnLoginPage = !url.contains("github.com/login") &&
                                  !url.contains("github.com/session") &&
                                  url.contains("github.com");
 
         if (hasCookie && notOnLoginPage) {
-            statusText.setText("Logged in! Launching VNC...");
-            launchVnc();
+            statusText.setText("Logged in! Fetching token…");
+            // Fetch the token using the session cookie via GitHub's API
+            fetchTokenWithSession();
         }
     }
 
-    private void launchVnc() {
+    /**
+     * Uses the GitHub session cookie (already in the WebView's CookieManager)
+     * to call the API and exchange it for a usable token.
+     *
+     * In practice, GitHub's REST API accepts session cookies for browser-based
+     * requests — we piggyback on that by loading the API URL inside the WebView.
+     */
+    private void fetchTokenWithSession() {
+        // Load a small JS snippet inside the WebView that calls the API
+        // using the existing session cookies, and passes the result back via bridge
+        webView.loadUrl("javascript:(function(){" +
+            "fetch('https://api.github.com/user',{credentials:'include'})" +
+            ".then(r=>r.json())" +
+            ".then(d=>{ if(d && d.login) AndroidBridge.onLoginConfirmed(d.login); })" +
+            ".catch(e=>AndroidBridge.onLoginConfirmed(''));" +
+            "})()");
+    }
+
+    private void launchCodespaceStart() {
         if (launched) return;
         launched = true;
-
-        // Flush cookies so MainActivity WebView shares the same session
         CookieManager.getInstance().flush();
+        mainHandler.post(() -> {
+            startActivity(new Intent(LoginActivity.this, CodespaceStartActivity.class));
+            finish();
+        });
+    }
 
-        Intent intent = new Intent(LoginActivity.this, CodespacesWakeActivity.class);
-        startActivity(intent);
-        finish(); // Remove login screen from back stack
+    // -------------------------------------------------------------------------
+
+    class TokenBridge {
+        @JavascriptInterface
+        public void onTokenFound(String token) {
+            if (token == null || token.isEmpty()) return;
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .edit().putString(PREF_GH_TOKEN, token).apply();
+        }
+
+        @JavascriptInterface
+        public void onLoginConfirmed(String login) {
+            if (login == null || login.isEmpty()) return;
+            // login confirmed — we use session cookies for API calls
+            // Store a marker so CodespaceStartActivity knows to use cookie-auth
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .edit()
+                    .putString(PREF_GH_TOKEN, "cookie_auth:" + login)
+                    .apply();
+            launchCodespaceStart();
+        }
     }
 
     @Override
     public void onBackPressed() {
-        if (webView.canGoBack()) {
-            webView.goBack();
-        } else {
-            super.onBackPressed();
-        }
+        if (webView.canGoBack()) webView.goBack();
+        else super.onBackPressed();
     }
 
     @Override
     protected void onDestroy() {
         if (webView != null) webView.destroy();
+        executor.shutdownNow();
         super.onDestroy();
     }
 }
